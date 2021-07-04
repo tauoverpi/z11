@@ -265,7 +265,51 @@ const types = struct {
         wm_transient_for = 68,
     };
 
-    pub const Window = enum(u32) { _ };
+    pub const Window = enum(u32) {
+        _,
+
+        pub const CreateWindowOptions = struct {
+            class: x11.request.CreateWindow.Class = .input_output,
+            border_width: u8 = 0,
+            depth: u8 = 24,
+            // TODO: extra options
+        };
+
+        pub fn createWindow(
+            parent: Window,
+            xclient: *XClient,
+            x: i16,
+            y: i16,
+            width: u16,
+            height: u16,
+            options: CreateWindowOptions,
+        ) !Window {
+            const writer = xclient.stream.writer();
+            const window = xclient.session.xid().cast(Window);
+
+            var buffer: [@sizeOf(x11.request.CreateWindow)]u8 align(4) = undefined;
+
+            @ptrCast(*x11.request.CreateWindow, &buffer).* = .{
+                .id = window,
+                .parent = parent,
+                .class = options.class,
+                .depth = options.depth,
+                .x = x,
+                .y = y,
+                .width = width,
+                .height = height,
+                .border_width = options.border_width,
+                .value_mask = .{},
+            };
+
+            try writer.writeAll(&buffer);
+
+            return window;
+        }
+
+        pub fn destroy(_: Window) void {}
+    };
+
     pub const Pixmap = enum(u32) { _ };
     pub const Cursor = enum(u32) { _ };
     pub const Font = enum(u32) { _ };
@@ -349,6 +393,17 @@ const types = struct {
         south_west,
         south,
         south_east,
+    };
+
+    pub const Xid = enum(u32) {
+        _,
+
+        pub fn cast(id: Xid, comptime T: type) T {
+            switch (T) {
+                Window => return @intToEnum(Window, @enumToInt(id)),
+                else => @compileError("cannot cast Xid to " ++ @typeName(T)),
+            }
+        }
     };
 };
 
@@ -535,8 +590,10 @@ const xc_misc = struct {
 
 const Session = struct {
     bytes: []align(4) const u8,
-    formats_offset: u32,
-    screens_offset: u32,
+
+    pub fn xid(self: *Session) types.Xid {
+        return @intToEnum(types.Xid, self.setup().resource_id_base); // TODO: fix this
+    }
 
     pub fn setup(self: Session) *const protocol.Setup {
         return mem.bytesAsValue(protocol.Setup, self.bytes[0..@sizeOf(protocol.Setup)]);
@@ -550,16 +607,24 @@ const Session = struct {
 
     pub fn formats(self: Session) []const protocol.Format {
         const s = self.setup();
+        const offset = s.vendor_len +
+            @sizeOf(protocol.Setup);
+
         return @ptrCast(
             [*]const protocol.Format,
-            &self.bytes[self.formats_offset],
+            &self.bytes[offset],
         )[0..s.pixmap_formats_len];
     }
 
     pub fn screens(self: Session) ScreenIterator {
         const s = self.setup();
+        const offset = s.vendor_len +
+            @sizeOf(protocol.Setup) +
+            @sizeOf(protocol.Format) *
+            s.pixmap_formats_len;
+
         return ScreenIterator{
-            .bytes = self.bytes[self.screens_offset..],
+            .bytes = self.bytes[offset..],
             .remain = s.roots_len,
         };
     }
@@ -580,7 +645,7 @@ const Session = struct {
         )[0..depth.visuals_len];
     }
 
-    const ScreenIterator = struct {
+    pub const ScreenIterator = struct {
         bytes: []align(4) const u8,
         index: u32 = 0,
         remain: u8,
@@ -591,11 +656,7 @@ const Session = struct {
 
             const result = @ptrCast(*const protocol.Screen, @alignCast(4, &self.bytes[self.index]));
 
-            var session: Session = .{
-                .bytes = self.bytes,
-                .formats_offset = undefined,
-                .screens_offset = undefined,
-            };
+            var session: Session = .{ .bytes = self.bytes };
 
             var it = session.depths(result);
             while (it.next()) |depth| {
@@ -607,7 +668,7 @@ const Session = struct {
         }
     };
 
-    const DepthIterator = struct {
+    pub const DepthIterator = struct {
         bytes: []align(4) const u8,
         index: u32 = 0,
         remain: u8,
@@ -626,150 +687,111 @@ const Session = struct {
     }
 };
 
-/// XClient dispatches calls to methods defined within the passed struct
-///
-/// Hande some stuff
-/// ```
-/// pub fn handleSomeEvent(self: *T, args: Arg) !void;
-/// ```
-fn XClient(comptime T: type) type {
-    return struct {
-        stream: std.net.Stream,
-        client: T,
-        session: Session,
+const XClient = struct {
+    stream: std.net.Stream,
+    session: Session,
 
-        const Self = @This();
+    pub fn connect(gpa: *Allocator) !XClient {
+        const log = std.log.scoped(.x11_connect);
 
-        pub fn connect(gpa: *Allocator, client: T) !Self {
-            const log = std.log.scoped(.x11_connect);
+        var it = try XAuthIterator.init(gpa);
+        defer it.deinit(gpa);
 
-            var it = try XAuthIterator.init(gpa);
-            defer it.deinit(gpa);
+        // TODO: validate hostname
+        const auth = (try it.next()) orelse return error.NoXAuthFound;
 
-            // TODO: validate hostname
-            const auth = (try it.next()) orelse return error.NoXAuthFound;
+        log.debug("xauth hostname:{s} display:{s} method:{s} data:{s}", .{
+            auth.address,
+            auth.number,
+            auth.name,
+            fmt.fmtSliceHexUpper(auth.data),
+        });
 
-            log.debug("xauth hostname:{s} display:{s} method:{s} data:{s}", .{
-                auth.address,
-                auth.number,
-                auth.name,
-                fmt.fmtSliceHexUpper(auth.data),
-            });
+        var auth_buffer = try gpa.alloc(u8, auth.size());
+        defer gpa.free(auth_buffer);
 
-            var auth_buffer = try gpa.alloc(u8, auth.size());
-            defer gpa.free(auth_buffer);
+        const request = try auth.request(auth_buffer);
 
-            const request = try auth.request(auth_buffer);
+        const stream = try std.net.connectUnixSocket("/tmp/.X11-unix/X0");
+        const writer = stream.writer();
+        const reader = stream.reader();
 
-            const stream = try std.net.connectUnixSocket("/tmp/.X11-unix/X0");
-            const writer = stream.writer();
-            const reader = stream.reader();
+        try writer.writeAll(request);
 
-            try writer.writeAll(request);
+        const Header = extern struct {
+            status: Status,
+            pad: [5]u8,
+            length: u16,
 
-            const Header = extern struct {
-                status: Status,
-                pad: [5]u8,
-                length: u16,
-
-                pub const Status = enum(u8) {
-                    setup_faied,
-                    ok,
-                    authenticate,
-                    _,
-                };
+            pub const Status = enum(u8) {
+                setup_faied,
+                ok,
+                authenticate,
+                _,
             };
+        };
 
-            const header = try reader.readStruct(Header);
+        const header = try reader.readStruct(Header);
 
-            const session = try gpa.allocAdvanced(u8, 4, header.length * 4, .exact);
+        const session = try gpa.allocAdvanced(u8, 4, header.length * 4, .exact);
 
-            try reader.readNoEof(session);
+        try reader.readNoEof(session);
 
-            // get pointers to data blocks
-            const info = blk: {
-                var fbs = io.fixedBufferStream(session);
-                const r = fbs.reader();
+        // get pointers to data blocks
+        {
+            var fbs = io.fixedBufferStream(session);
+            const r = fbs.reader();
 
-                try r.skipBytes(@sizeOf(protocol.Setup), .{});
+            try r.skipBytes(@sizeOf(protocol.Setup), .{});
 
-                const vendor_len = mem.readIntSliceNative(u16, session[@offsetOf(protocol.Setup, "vendor_len")..]);
-                try r.skipBytes(vendor_len, .{});
+            const vendor_len = mem.readIntSliceNative(
+                u16,
+                session[@offsetOf(protocol.Setup, "vendor_len")..],
+            );
+            try r.skipBytes(vendor_len, .{});
 
-                const pixmap_offset = session[@offsetOf(protocol.Setup, "pixmap_formats_len")..];
-                const pixmap_formats_len = mem.readIntSliceNative(u8, pixmap_offset);
-                const formats = fbs.pos;
-                try r.skipBytes(@sizeOf(protocol.Format) * pixmap_formats_len, .{});
-
-                const screens = fbs.pos;
-
-                break :blk .{
-                    .formats = @intCast(u32, formats),
-                    .screens = @intCast(u32, screens),
-                };
-            };
-            _ = info;
-
-            return Self{
-                .stream = stream,
-                .client = client,
-                .session = Session{
-                    .bytes = session,
-                    .formats_offset = info.formats,
-                    .screens_offset = info.screens,
-                },
-            };
+            const pixmap_offset = session[@offsetOf(protocol.Setup, "pixmap_formats_len")..];
+            const pixmap_formats_len = mem.readIntSliceNative(u8, pixmap_offset);
+            try r.skipBytes(@sizeOf(protocol.Format) * pixmap_formats_len, .{});
         }
 
-        pub fn call(self: *Self, event: Reactor.Event) !void {
-            _ = event;
-            try self.dispatch();
-        }
+        return XClient{
+            .stream = stream,
+            .session = Session{ .bytes = session },
+        };
+    }
 
-        pub fn dispatch(self: *Self) !void {
-            switch (byte) {
-                .request => if (@hasDecl(T, "request")) self.client.request(),
-                .request => if (@hasDecl(T, "request")) self.client.request(),
-                .request => if (@hasDecl(T, "request")) self.client.request(),
-                // ..
-            }
-        }
+    pub fn call(self: *XClient, event: Reactor.Event) !void {
+        _ = event;
+        try self.dispatch();
+    }
 
-        pub fn close(self: *Self, gpa: *Allocator) void {
-            self.stream.close();
-            gpa.free(self.session.bytes);
-            self.* = undefined;
+    pub fn dispatch(self: *XClient, client: anytype) !void {
+        const T = @TypeOf(client);
+        switch (byte) {
+            .request => if (@hasDecl(T, "request")) self.client.request(),
+            .request => if (@hasDecl(T, "request")) self.client.request(),
+            .request => if (@hasDecl(T, "request")) self.client.request(),
+            // ..
         }
-    };
-}
+    }
+
+    pub fn close(self: *XClient, gpa: *Allocator) void {
+        self.stream.close();
+        gpa.free(self.session.bytes);
+        self.* = undefined;
+    }
+};
 
 test "open a window" {
     const gpa = testing.allocator;
-    var client = try XClient(struct {}).connect(gpa, .{});
+    var client = try XClient.connect(gpa);
     defer client.close(gpa);
 
-    const setup = client.session.setup();
     const screen = client.session.screens().next().?;
-    std.log.info("{}", .{setup});
 
-    const id = @bitCast(i32, setup.resource_id_mask) & -@bitCast(i32, setup.resource_id_mask);
-
-    std.log.info("id: {}", .{id});
-
-    const cw: x11.request.CreateWindow = .{
-        .id = @intToEnum(types.Window, setup.resource_id_base),
-        .parent = screen.root,
-        .class = .input_output,
-        .depth = screen.root_depth,
-        .x = 1,
-        .y = 1,
-        .width = 1200,
-        .height = 720,
-        .border_width = 0,
-        .value_mask = .{},
-    };
-
-    try client.stream.writer().writeAll(mem.asBytes(&cw));
+    const w = try screen.root.createWindow(&client, 0, 0, 1200, 720, .{});
+    defer w.destroy();
 
     try std.x.os.Socket.from(client.stream.handle).setReadTimeout(10);
 
@@ -777,6 +799,15 @@ test "open a window" {
         error.WouldBlock,
         client.stream.reader().readBytesNoEof(32),
     );
+}
+
+test "map window" {
+    const gpa = testing.allocator;
+    var client = try XClient.connect(gpa);
+    defer client.close(gpa);
+
+    //const setup = client.session.setup();
+    //const screen = client.session.screens().next().?;
 }
 
 pub fn main() anyerror!void {
