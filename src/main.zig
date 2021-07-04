@@ -4,6 +4,8 @@ const os = std.os;
 const fs = std.fs;
 const fmt = std.fmt;
 const mem = std.mem;
+const testing = std.testing;
+const assert = std.debug.assert;
 
 const Allocator = std.mem.Allocator;
 const Reactor = std.x.os.Reactor;
@@ -431,6 +433,98 @@ const protocol = struct {
     };
 };
 
+const x11 = struct {
+    pub const Error = extern struct {
+        opcode: u8 = 0,
+        code: ErrorCode,
+        sequence: u16,
+        bad_value: u32,
+        minor_opcode: u16,
+        major_opcode: u8,
+        unused: [21]u8,
+
+        pub const ErrorCode = enum(u8) {
+            request = 1,
+            value = 2,
+            window = 3,
+            pixmap = 4,
+            atom = 5,
+            cursor = 6,
+            font = 7,
+            match = 8,
+            drawable = 9,
+            access = 10,
+            alloc = 11,
+            colormap = 12,
+            g_context = 13,
+            id_choice = 14,
+            name = 15,
+            length = 16,
+            implementation = 17,
+        };
+    };
+
+    pub const request = struct {
+        pub const Opcode = enum(u8) {
+            create_window = 1,
+        };
+
+        pub const CreateWindow = extern struct {
+            opcode: Opcode = .create_window,
+            depth: u8,
+            request_length: u16 = 8,
+            id: types.Window,
+            parent: types.Window,
+            x: i16,
+            y: i16,
+            width: u16,
+            height: u16,
+            border_width: u16,
+            class: Class,
+            value_mask: Bitmask,
+
+            comptime {
+                assert(@bitSizeOf(Bitmask) == 32);
+            }
+
+            pub const Bitmask = packed struct {
+                background_pixmap: bool = false,
+                background_pixel: bool = false,
+                border_pixmap: bool = false,
+                border_pixel: bool = false,
+
+                bit_gravity: bool = false,
+                /// Input window only
+                win_gravity: bool = false,
+                backing_store: bool = false,
+                backing_planes: bool = false,
+
+                backing_pixel: bool = false,
+                save_under: bool = false,
+                /// Input window only
+                event_mask: bool = false,
+                /// Input window only
+                do_not_propagate_mask: bool = false,
+
+                /// Input window only
+                override_redirect: bool = false,
+                colormap: bool = false,
+                cursor: bool = false,
+                pad0: u1 = 0,
+                pad1: u16 = 0,
+            };
+
+            pub const Class = enum(u16) {
+                input_output,
+                input_only,
+                copy_from_parent,
+            };
+        };
+    };
+
+    pub const reply = struct {};
+};
+
 const xc_misc = struct {
     pub const request = struct {
         pub const GetVersion = extern struct { major: u16, minor: u16 };
@@ -641,112 +735,49 @@ fn XClient(comptime T: type) type {
             }
         }
 
-        pub fn close(self: *Self) void {
+        pub fn close(self: *Self, gpa: *Allocator) void {
             self.stream.close();
+            gpa.free(self.session.bytes);
             self.* = undefined;
         }
     };
 }
 
-/// AsyncClient is a wrapper for X clients which forwards events to the client
-/// while allowing a sequential style.
-///
-/// ```
-/// const Client = AsyncClient(struct {
-///     pub fn xmain(self: *Self, x11: Context) anyerror!void {
-///         const window = try x11.createWindow("hi", 0, 0, 1200, 720);
-///         defer window.deinit();
-///
-///         const gc = try window.getGraphicsContext();
-///         defer gc.deinit();
-///
-///         try gc.setBackgroud(0);
-///
-///         while (true) {
-///             try ctx.pollEvents();
-///             // main loop code
-///         }
-///     }
-/// });
-/// ```
-fn AsyncClient(comptime C: type) type {
-    return struct {
-        frame: @Frame(T.xmain),
-        wait_queue: Queue,
-        client: T,
+test "open a window" {
+    const gpa = testing.allocator;
+    var client = try XClient(struct {}).connect(gpa, .{});
+    defer client.close(gpa);
 
-        const T = C(Context);
+    const setup = client.session.setup();
+    const screen = client.session.screens().next().?;
+    std.log.info("{}", .{setup});
 
-        const Queue = std.TailQueue(Entry);
-        const Node = Queue.Node;
+    const id = @bitCast(i32, setup.resource_id_mask) & -@bitCast(i32, setup.resource_id_mask);
 
-        const Entry = struct {
-            frame: anyframe,
-        };
+    std.log.info("id: {}", .{id});
 
-        const Context = struct {
-            queue: *opaque {},
-            pub fn yield(self: Context) void {
-                suspend {
-                    var frame = @frame();
-                    var node: Node = .{
-                        .next = undefined,
-                        .prev = undefined,
-                        .data = .{
-                            .frame = &frame,
-                        },
-                    };
-
-                    @ptrCast(*Queue, self.queue).push(&node);
-                }
-            }
-        };
-
-        pub inline fn requestCallback(self: *Self) !void {
-            if (@hasDecl(T, "requestCallback")) {
-                self.client.requestCallback();
-            }
-        }
+    const cw: x11.request.CreateWindow = .{
+        .id = @intToEnum(types.Window, setup.resource_id_base),
+        .parent = screen.root,
+        .class = .input_output,
+        .depth = screen.root_depth,
+        .x = 1,
+        .y = 1,
+        .width = 1200,
+        .height = 720,
+        .border_width = 0,
+        .value_mask = .{},
     };
+
+    try client.stream.writer().writeAll(mem.asBytes(&cw));
+
+    try std.x.os.Socket.from(client.stream.handle).setReadTimeout(10);
+
+    try testing.expectError(
+        error.WouldBlock,
+        client.stream.reader().readBytesNoEof(32),
+    );
 }
-
-fn ExampleXApplication(comptime Context: type) type {
-    return struct {
-        const Self = @This();
-
-        fn keypressCallback(self: *Self, scancode: u32, stuff: Stuff) !void {
-            _ = self;
-            _ = scancode;
-            _ = stuff;
-            @panic("oh noes");
-        }
-
-        pub fn xmain(ctx: Context) anyerror!void {
-            const window = try ctx.createWindow("hello", 0, 0, 1200, 720);
-            defer window.deinit();
-
-            try window.register(.{
-                .key_press = keypressCallback,
-            });
-
-            const gc = try window.createGraphicsContext();
-            defer gc.deinit();
-
-            var colour: u32 = 0x0000ff;
-
-            while (true) {
-                while (try ctx.pollEvents()) {}
-
-                try gc.setBackground(colour);
-                colour = ~colour; // ensure epileptic seizures pokemon style
-            }
-        }
-    };
-}
-
-const Reply = struct {
-    bytes: [32]u8,
-};
 
 pub fn main() anyerror!void {
     const gpa = std.heap.page_allocator;
@@ -755,10 +786,7 @@ pub fn main() anyerror!void {
     var client = try XClient(struct {}).connect(gpa, .{});
     _ = client;
 
-    const setup = client.session.setup();
-    const id = @bitCast(i32, setup.resource_id_mask) & -@bitCast(i32, setup.resource_id_base);
-    const xid = id;
-    std.log.info("{x} {x} {} {}", .{ setup.resource_id_mask, setup.resource_id_base, id, xid });
+    //const setup = client.session.setup();
 
     //var reactor = try Reactor.init(.{ .close_on_exec = true });
 
