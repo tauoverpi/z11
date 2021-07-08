@@ -1,6 +1,8 @@
 const std = @import("std");
+const lib = @import("lib.zig");
 const mem = std.mem;
 const Allocator = std.mem.Allocator;
+const types = lib.types;
 
 const Session = @This();
 
@@ -36,7 +38,7 @@ pub const Setup = extern struct {
     };
 
     pub const Visual = extern struct {
-        visual: u32,
+        visual: types.VisualId,
         class: u8,
         bits_per_rgb_value: u8,
         colormap_entries: u16,
@@ -47,7 +49,7 @@ pub const Setup = extern struct {
     };
 
     pub const Screen = extern struct {
-        root: u32,
+        root: types.Window,
         default_colormap: u32,
         white_pixel: u32,
         black_pixel: u32,
@@ -58,7 +60,7 @@ pub const Setup = extern struct {
         height_milimiter: u16,
         min_maps: u16,
         max_maps: u16,
-        root_visual: u32,
+        root_visual: types.VisualId,
         backing_store: u8,
         save_unders: u8,
         root_depth: u8,

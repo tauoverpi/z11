@@ -2,6 +2,7 @@ const lib = @import("lib.zig");
 const types = lib.types;
 
 pub const Opcode = enum(u8) {
+    @"error" = 0,
     create_window = 1,
     change_window_attributes = 2,
     get_window_attributes = 3,
@@ -162,7 +163,7 @@ pub const Event = enum(u8) {
 
 pub const EventMask = packed struct {
     key_press: bool = false,
-    key_releae: bool = fale,
+    key_releae: bool = false,
     button_press: bool = false,
     button_release: bool = false,
     enter_window: bool = false,
